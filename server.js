@@ -81,7 +81,9 @@ function getCurrentDate() {
 }
 
 function checkAvailability({ preferred_date, service_name }) {
-  const date    = new Date(preferred_date || Date.now());
+  const today   = new Date();
+  const todayStr = today.toISOString().split('T')[0];
+  const date    = preferred_date ? new Date(preferred_date) : today;
   const dateStr = date.toISOString().split('T')[0];
   const data    = readDB();
 
@@ -102,6 +104,8 @@ function checkAvailability({ preferred_date, service_name }) {
 
   return {
     available: true,
+    today: todayStr,
+    today_formatted: formatDate(today),
     date: formatDate(date),
     service: service_name,
     slots: top,
