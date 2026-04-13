@@ -1,107 +1,90 @@
 require('dotenv').config();
 const express = require('express');
-const twilio = require('twilio');
-const Database = require('better-sqlite3');
-const path = require('path');
-const crypto = require('crypto');
+const twilio  = require('twilio');
+const crypto  = require('crypto');
+const fs      = require('fs');
+const path    = require('path');
 
 const app = express();
 app.use(express.json());
 
-// ─── Database setup ───────────────────────────────────────────────────────────
-const db = new Database(path.join(__dirname, 'appointments.db'));
-db.exec(`
-  CREATE TABLE IF NOT EXISTS appointments (
-    id TEXT PRIMARY KEY,
-    patient_name TEXT NOT NULL,
-    patient_phone TEXT NOT NULL,
-    service_name TEXT NOT NULL,
-    datetime TEXT NOT NULL,
-    notes TEXT,
-    status TEXT DEFAULT 'confirmed',
-    created_at TEXT DEFAULT (datetime('now'))
-  )
-`);
+// ─── Simple JSON store ────────────────────────────────────────────────────────
+const DB_FILE = path.join(__dirname, 'db.json');
 
-// ─── Twilio ───────────────────────────────────────────────────────────────────
+function readDB() {
+  try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
+  catch { return { appointments: [] }; }
+}
+
+function writeDB(data) {
+  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+}
+
+// ─── Config ───────────────────────────────────────────────────────────────────
 const twilioClient = process.env.TWILIO_ACCOUNT_SID
   ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
   : null;
 
-const CLINIC_NAME = process.env.CLINIC_NAME || 'Luxe Medical Spa';
-const CLINIC_PHONE = process.env.CLINIC_PHONE || '';
-const TWILIO_FROM = process.env.TWILIO_FROM_NUMBER || '';
+const CLINIC_NAME  = process.env.CLINIC_NAME       || 'Luxe Medical Spa';
+const CLINIC_PHONE = process.env.CLINIC_PHONE       || '';
+const TWILIO_FROM  = process.env.TWILIO_FROM_NUMBER || '';
 
-// ─── Health check ─────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.json({
-  status: 'AI Receptionist running',
-  clinic: CLINIC_NAME,
-  appointments: db.prepare('SELECT COUNT(*) as count FROM appointments WHERE status = ?').get('confirmed').count
-}));
-
-// ─── Admin: view all appointments ─────────────────────────────────────────────
-app.get('/appointments', (req, res) => {
-  const appts = db.prepare('SELECT * FROM appointments ORDER BY datetime ASC').all();
-  res.json(appts);
+// ─── Routes ───────────────────────────────────────────────────────────────────
+app.get('/', (req, res) => {
+  const data = readDB();
+  const confirmed = data.appointments.filter(a => a.status === 'confirmed').length;
+  res.json({ status: 'AI Receptionist running', clinic: CLINIC_NAME, confirmed_appointments: confirmed });
 });
 
-// ─── Retell function tool handler ─────────────────────────────────────────────
+app.get('/appointments', (req, res) => {
+  const data = readDB();
+  const sorted = data.appointments.sort((a, b) => a.datetime.localeCompare(b.datetime));
+  res.json(sorted);
+});
+
 app.post('/retell-functions', (req, res) => {
   const { name, arguments: args } = req.body;
-  console.log(`[CALL] Tool: ${name}`, JSON.stringify(args));
-
+  console.log(`[TOOL] ${name}`, JSON.stringify(args));
   try {
-    switch (name) {
-      case 'check_availability':
-        return res.json(checkAvailability(args));
-      case 'book_appointment':
-        return res.json(bookAppointment(args));
-      case 'get_appointments':
-        return res.json(getAppointments(args));
-      case 'reschedule_appointment':
-        return res.json(rescheduleAppointment(args));
-      case 'cancel_appointment':
-        return res.json(cancelAppointment(args));
-      case 'send_confirmation':
-        return res.json(sendConfirmationTool(args));
-      default:
-        return res.json({ success: false, message: `Unknown tool: ${name}` });
-    }
+    const handlers = {
+      check_availability:     () => checkAvailability(args),
+      book_appointment:       () => bookAppointment(args),
+      get_appointments:       () => getAppointments(args),
+      reschedule_appointment: () => rescheduleAppointment(args),
+      cancel_appointment:     () => cancelAppointment(args),
+      send_confirmation:      () => sendConfirmationTool(args),
+    };
+    const handler = handlers[name];
+    if (!handler) return res.json({ success: false, message: `Unknown tool: ${name}` });
+    return res.json(handler());
   } catch (err) {
-    console.error(`[ERROR] ${name}:`, err.message);
+    console.error(`[ERROR] ${name}:`, err.message, err.stack);
     return res.json({ success: false, message: 'Something went wrong. Let me transfer you to a team member.' });
   }
 });
 
-// ─── Retell webhook ───────────────────────────────────────────────────────────
 app.post('/retell-webhook', (req, res) => {
-  const { event, call } = req.body;
-  console.log(`[WEBHOOK] ${event} — call_id: ${call?.call_id}`);
+  console.log(`[WEBHOOK] ${req.body?.event}`);
   res.sendStatus(200);
 });
 
-// ─── Tool: check_availability ─────────────────────────────────────────────────
+// ─── Tool functions ───────────────────────────────────────────────────────────
 function checkAvailability({ preferred_date, service_name }) {
-  const date = preferred_date ? new Date(preferred_date) : new Date();
+  const date    = new Date(preferred_date || Date.now());
   const dateStr = date.toISOString().split('T')[0];
+  const data    = readDB();
 
-  // Get booked slots for this day
-  const booked = db.prepare(
-    "SELECT datetime FROM appointments WHERE datetime LIKE ? AND status = 'confirmed'"
-  ).all(`${dateStr}%`).map(r => new Date(r.datetime).getHours());
+  const bookedHours = data.appointments
+    .filter(a => a.status === 'confirmed' && a.datetime.startsWith(dateStr))
+    .map(a => new Date(a.datetime).getHours());
 
-  // Business hours: 9am–5pm, 1-hour slots
-  const allSlots = [9, 10, 11, 12, 13, 14, 15, 16];
-  const available = allSlots.filter(h => !booked.includes(h));
+  const freeSlots = [9,10,11,12,13,14,15,16].filter(h => !bookedHours.includes(h));
 
-  if (available.length === 0) {
-    return {
-      available: false,
-      message: `No availability on ${formatDate(date)} for ${service_name || 'that service'}. Would you like to check a different day?`
-    };
+  if (!freeSlots.length) {
+    return { available: false, message: `No availability on ${formatDate(date)}. Would you like to check a different day?` };
   }
 
-  const topSlots = available.slice(0, 3).map(h => ({
+  const top = freeSlots.slice(0, 3).map(h => ({
     time: formatTime(h),
     datetime: `${dateStr}T${String(h).padStart(2,'0')}:00:00`
   }));
@@ -110,127 +93,103 @@ function checkAvailability({ preferred_date, service_name }) {
     available: true,
     date: formatDate(date),
     service: service_name,
-    slots: topSlots,
-    message: `I have ${topSlots.length} openings on ${formatDate(date)}: ${topSlots.map(s => s.time).join(', ')}. Which works best for you?`
+    slots: top,
+    message: `I have openings on ${formatDate(date)} at: ${top.map(s => s.time).join(', ')}. Which works best for you?`
   };
 }
 
-// ─── Tool: book_appointment ───────────────────────────────────────────────────
 function bookAppointment({ patient_name, patient_phone, service_name, datetime, notes }) {
-  const id = crypto.randomUUID();
-  const dt = new Date(datetime);
+  const data = readDB();
+  const id   = crypto.randomUUID();
+  const dt   = new Date(datetime);
 
-  db.prepare(
-    'INSERT INTO appointments (id, patient_name, patient_phone, service_name, datetime, notes) VALUES (?, ?, ?, ?, ?, ?)'
-  ).run(id, patient_name, patient_phone, service_name, dt.toISOString(), notes || '');
+  data.appointments.push({
+    id, patient_name, patient_phone, service_name,
+    datetime: dt.toISOString(), notes: notes || '',
+    status: 'confirmed', created_at: new Date().toISOString()
+  });
+  writeDB(data);
 
-  // SMS confirmation
-  if (patient_phone && twilioClient) {
-    sendSMS(patient_phone,
-      `Hi ${patient_name}! Your ${service_name} at ${CLINIC_NAME} is confirmed for ${formatDate(dt)} at ${formatTime(dt.getHours())}. To cancel/reschedule call ${CLINIC_PHONE}. See you soon!`
-    );
-  }
+  sendSMS(patient_phone,
+    `Hi ${patient_name}! Your ${service_name} at ${CLINIC_NAME} is confirmed for ${formatDate(dt)} at ${formatTime(dt.getHours())}. To cancel/reschedule call ${CLINIC_PHONE}. See you soon!`
+  );
 
   return {
     success: true,
     appointment_id: id,
-    message: `Perfect! Your ${service_name} is booked for ${formatDate(dt)} at ${formatTime(dt.getHours())}. You'll receive a confirmation text shortly. Is there anything else I can help you with?`
+    message: `Perfect! Your ${service_name} is booked for ${formatDate(dt)} at ${formatTime(dt.getHours())}. A confirmation text is on its way. Is there anything else I can help you with?`
   };
 }
 
-// ─── Tool: get_appointments ───────────────────────────────────────────────────
 function getAppointments({ patient_phone, patient_name }) {
-  let appointments;
-  if (patient_phone) {
-    appointments = db.prepare(
-      "SELECT * FROM appointments WHERE patient_phone = ? AND status = 'confirmed' AND datetime > datetime('now') ORDER BY datetime ASC"
-    ).all(patient_phone);
-  } else {
-    appointments = db.prepare(
-      "SELECT * FROM appointments WHERE patient_name LIKE ? AND status = 'confirmed' AND datetime > datetime('now') ORDER BY datetime ASC"
-    ).all(`%${patient_name}%`);
-  }
+  const data = readDB();
+  const now  = new Date().toISOString();
 
-  if (appointments.length === 0) {
-    return { found: false, message: `I don't see any upcoming appointments. Would you like to book one?` };
-  }
+  let appts = data.appointments.filter(a => a.status === 'confirmed' && a.datetime > now);
+  if (patient_phone) appts = appts.filter(a => a.patient_phone === patient_phone);
+  else if (patient_name) appts = appts.filter(a => a.patient_name.toLowerCase().includes(patient_name.toLowerCase()));
+
+  if (!appts.length) return { found: false, message: `No upcoming appointments found. Would you like to book one?` };
 
   return {
     found: true,
-    appointments: appointments.map(a => ({
-      id: a.id,
-      service: a.service_name,
-      datetime: a.datetime,
-      formatted: `${a.service_name} on ${formatDate(new Date(a.datetime))} at ${formatTime(new Date(a.datetime).getHours())}`
-    })),
-    message: `I found ${appointments.length} upcoming appointment${appointments.length > 1 ? 's' : ''}: ${appointments.map(a => `${a.service_name} on ${formatDate(new Date(a.datetime))} at ${formatTime(new Date(a.datetime).getHours())}`).join('; ')}.`
+    appointments: appts.map(a => ({ id: a.id, service: a.service_name, datetime: a.datetime })),
+    message: `Found ${appts.length} appointment${appts.length>1?'s':''}: ${appts.map(a=>`${a.service_name} on ${formatDate(new Date(a.datetime))} at ${formatTime(new Date(a.datetime).getHours())}`).join('; ')}.`
   };
 }
 
-// ─── Tool: reschedule_appointment ─────────────────────────────────────────────
 function rescheduleAppointment({ appointment_id, new_datetime, patient_name, patient_phone }) {
-  const appt = db.prepare('SELECT * FROM appointments WHERE id = ?').get(appointment_id);
-  if (!appt) return { success: false, message: "I couldn't find that appointment. Let me look it up again." };
-
-  const newDt = new Date(new_datetime);
-  db.prepare('UPDATE appointments SET datetime = ? WHERE id = ?').run(newDt.toISOString(), appointment_id);
-
-  if (patient_phone && twilioClient) {
-    sendSMS(patient_phone,
-      `Hi ${patient_name || appt.patient_name}! Your appointment at ${CLINIC_NAME} has been rescheduled to ${formatDate(newDt)} at ${formatTime(newDt.getHours())}. Questions? Call ${CLINIC_PHONE}.`
-    );
-  }
-
-  return {
-    success: true,
-    message: `Done! I've moved your ${appt.service_name} to ${formatDate(newDt)} at ${formatTime(newDt.getHours())}. A confirmation text is on its way.`
-  };
-}
-
-// ─── Tool: cancel_appointment ─────────────────────────────────────────────────
-function cancelAppointment({ appointment_id, patient_name, patient_phone }) {
-  const appt = db.prepare('SELECT * FROM appointments WHERE id = ?').get(appointment_id);
+  const data = readDB();
+  const appt = data.appointments.find(a => a.id === appointment_id);
   if (!appt) return { success: false, message: "I couldn't find that appointment." };
 
-  db.prepare("UPDATE appointments SET status = 'cancelled' WHERE id = ?").run(appointment_id);
+  const newDt = new Date(new_datetime);
+  appt.datetime = newDt.toISOString();
+  writeDB(data);
 
-  if (patient_phone && twilioClient) {
-    sendSMS(patient_phone,
-      `Hi ${patient_name || appt.patient_name}, your ${appt.service_name} at ${CLINIC_NAME} has been cancelled. We hope to see you again! Book anytime by calling ${CLINIC_PHONE}.`
-    );
-  }
+  sendSMS(patient_phone || appt.patient_phone,
+    `Hi ${patient_name || appt.patient_name}! Your appointment at ${CLINIC_NAME} has been rescheduled to ${formatDate(newDt)} at ${formatTime(newDt.getHours())}.`
+  );
 
-  return {
-    success: true,
-    message: `Your ${appt.service_name} has been cancelled. We hope to see you again soon — would you like to reschedule?`
-  };
+  return { success: true, message: `Done! Moved your ${appt.service_name} to ${formatDate(newDt)} at ${formatTime(newDt.getHours())}. Confirmation text sent.` };
 }
 
-// ─── Tool: send_confirmation ──────────────────────────────────────────────────
+function cancelAppointment({ appointment_id, patient_name, patient_phone }) {
+  const data = readDB();
+  const appt = data.appointments.find(a => a.id === appointment_id);
+  if (!appt) return { success: false, message: "I couldn't find that appointment." };
+
+  appt.status = 'cancelled';
+  writeDB(data);
+
+  sendSMS(patient_phone || appt.patient_phone,
+    `Hi ${patient_name || appt.patient_name}, your ${appt.service_name} at ${CLINIC_NAME} has been cancelled. We hope to see you again!`
+  );
+
+  return { success: true, message: `Your ${appt.service_name} has been cancelled. Would you like to reschedule?` };
+}
+
 function sendConfirmationTool({ patient_phone, patient_name, message }) {
-  if (!patient_phone || !twilioClient) return { success: false };
   sendSMS(patient_phone, message || `Thank you for calling ${CLINIC_NAME}, ${patient_name}!`);
-  return { success: true, message: 'Confirmation sent.' };
+  return { success: true };
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function sendSMS(to, body) {
-  if (!twilioClient) return;
+  if (!twilioClient || !to) return;
   twilioClient.messages.create({ to, from: TWILIO_FROM, body })
-    .then(() => console.log(`[SMS] Sent to ${to}`))
-    .catch(e => console.error('[SMS ERROR]', e.message));
+    .then(() => console.log(`[SMS] → ${to}`))
+    .catch(e => console.error('[SMS]', e.message));
 }
 
 function formatDate(date) {
-  return date.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+  return new Date(date).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
 }
 
 function formatTime(hour) {
-  const d = new Date();
-  d.setHours(hour, 0, 0, 0);
+  const d = new Date(); d.setHours(hour, 0, 0, 0);
   return d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
 }
 
-// ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`${CLINIC_NAME} AI Receptionist running on port ${PORT}`));
