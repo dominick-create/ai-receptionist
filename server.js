@@ -43,7 +43,8 @@ app.get('/appointments', (req, res) => {
 });
 
 app.post('/retell-functions', (req, res) => {
-  const { name, arguments: args } = req.body;
+  const { name } = req.body;
+  const args = req.body.args || req.body.arguments || {};
   console.log(`[TOOL] ${name}`, JSON.stringify(args));
   try {
     const handlers = {
