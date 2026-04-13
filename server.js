@@ -18,6 +18,39 @@ function writeDB(data) {
   fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
 }
 
+// ─── Timezone helpers ─────────────────────────────────────────────────────────
+// All date logic uses the clinic's local timezone so Railway (UTC) never
+// reports the wrong calendar day to US callers.
+const CLINIC_TZ = process.env.CLINIC_TIMEZONE || 'America/New_York';
+
+function todayInTZ() {
+  // Returns YYYY-MM-DD in clinic timezone
+  return new Date().toLocaleDateString('en-CA', { timeZone: CLINIC_TZ });
+}
+
+function nowFormatted() {
+  // Human-readable "Monday, April 13" in clinic timezone
+  return new Date().toLocaleDateString('en-US', {
+    timeZone: CLINIC_TZ, weekday: 'long', month: 'long', day: 'numeric'
+  });
+}
+
+function dayOfWeekInTZ(dateStr) {
+  // 0=Sun … 6=Sat for a YYYY-MM-DD string, evaluated at noon clinic time
+  const d = new Date(dateStr + 'T12:00:00');
+  return parseInt(
+    new Intl.DateTimeFormat('en-US', { timeZone: CLINIC_TZ, weekday: 'short' })
+      .formatToParts(d)
+      .find(p => p.type === 'weekday')
+      // map abbreviated weekday → JS day number
+      .value === 'Sun' ? 0 :
+    ['Mon','Tue','Wed','Thu','Fri','Sat'].indexOf(
+      new Intl.DateTimeFormat('en-US', { timeZone: CLINIC_TZ, weekday: 'short' })
+        .format(d).slice(0,3)
+    ) + 1
+  );
+}
+
 // ─── Config ───────────────────────────────────────────────────────────────────
 const twilioClient = process.env.TWILIO_ACCOUNT_SID
   ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
@@ -71,21 +104,21 @@ app.post('/retell-webhook', (req, res) => {
 
 // ─── Tool functions ───────────────────────────────────────────────────────────
 function checkAvailability({ preferred_date, service_name } = {}) {
-  const today    = new Date();
-  const todayStr = today.toISOString().split('T')[0];
-  const date     = preferred_date ? new Date(preferred_date + 'T12:00:00') : today;
-  const dateStr  = date.toISOString().split('T')[0];
+  const todayStr = todayInTZ();                            // YYYY-MM-DD in clinic TZ
+  const dateStr  = preferred_date || todayStr;
+  const date     = new Date(dateStr + 'T12:00:00');        // noon = safe day anchor
 
   // Block past dates
   if (dateStr < todayStr) {
-    return { available: false, today: todayStr, today_formatted: formatDate(today), message: `That date has already passed. The earliest I can book you is today, ${formatDate(today)} — want to check availability?` };
+    return { available: false, today: todayStr, today_formatted: nowFormatted(), message: `That date has already passed. The earliest I can book you is today, ${nowFormatted()} — want to check availability?` };
   }
 
-  // Block Sundays (day 0)
-  if (date.getDay() === 0) {
+  // Block Sundays
+  if (dayOfWeekInTZ(dateStr) === 0) {
     const monday = new Date(date);
     monday.setDate(monday.getDate() + 1);
-    return { available: false, today: todayStr, today_formatted: formatDate(today), message: `We're closed on Sundays. The next available day is ${formatDate(monday)} — want me to check that?` };
+    const mondayStr = monday.toLocaleDateString('en-CA', { timeZone: CLINIC_TZ });
+    return { available: false, today: todayStr, today_formatted: nowFormatted(), message: `We're closed on Sundays. The next available day is ${formatDate(monday)} — want me to check that?` };
   }
 
   const data     = readDB();
@@ -107,7 +140,7 @@ function checkAvailability({ preferred_date, service_name } = {}) {
     return {
       available: false,
       today: todayStr,
-      today_formatted: formatDate(today),
+      today_formatted: nowFormatted(),
       message: `${formatDate(date)} is fully booked. I do have openings on ${formatDate(tomorrow)} — ${tomorrowSlots.map(h => formatTime(h)).join(', ')}. Would any of those work?`,
       alternative_date: tomorrowStr,
       alternative_slots: tomorrowSlots.map(h => ({ time: formatTime(h), datetime: `${tomorrowStr}T${String(h).padStart(2,'0')}:00:00` }))
@@ -122,7 +155,7 @@ function checkAvailability({ preferred_date, service_name } = {}) {
   return {
     available: true,
     today: todayStr,
-    today_formatted: formatDate(today),
+    today_formatted: nowFormatted(),
     date: formatDate(date),
     service: service_name || 'appointment',
     slots: top,
@@ -150,6 +183,7 @@ async function bookAppointment({ patient_name, patient_phone, patient_email, ser
   }
 
   const data = readDB();
+  const id = crypto.randomUUID();
 
   const appointment = {
     id,
@@ -279,7 +313,7 @@ function buildConfirmationEmail({ patient_name, service_name, dateStr, timeStr }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function formatDate(date) {
-  return new Date(date).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+  return new Date(date).toLocaleDateString('en-US', { timeZone: CLINIC_TZ, weekday: 'long', month: 'long', day: 'numeric' });
 }
 function formatTime(hour) {
   const d = new Date(); d.setHours(hour, 0, 0, 0);
