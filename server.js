@@ -75,6 +75,19 @@ function checkAvailability({ preferred_date, service_name } = {}) {
   const todayStr = today.toISOString().split('T')[0];
   const date     = preferred_date ? new Date(preferred_date + 'T12:00:00') : today;
   const dateStr  = date.toISOString().split('T')[0];
+
+  // Block past dates
+  if (dateStr < todayStr) {
+    return { available: false, today: todayStr, today_formatted: formatDate(today), message: `That date has already passed. The earliest I can book you is today, ${formatDate(today)} — want to check availability?` };
+  }
+
+  // Block Sundays (day 0)
+  if (date.getDay() === 0) {
+    const monday = new Date(date);
+    monday.setDate(monday.getDate() + 1);
+    return { available: false, today: todayStr, today_formatted: formatDate(today), message: `We're closed on Sundays. The next available day is ${formatDate(monday)} — want me to check that?` };
+  }
+
   const data     = readDB();
 
   const bookedHours = data.appointments
@@ -122,9 +135,21 @@ async function bookAppointment({ patient_name, patient_phone, patient_email, ser
     return { success: false, message: "I just need your name, the service you'd like, and a time — then I can get you locked in." };
   }
 
+  const dt = new Date(datetime);
+
+  // Block past bookings
+  if (dt < new Date()) {
+    return { success: false, message: "That date has already passed — let me find you an upcoming slot instead." };
+  }
+
+  // Normalize phone to E.164 for SMS
+  if (patient_phone) {
+    patient_phone = patient_phone.replace(/\D/g, '');
+    if (patient_phone.length === 10) patient_phone = '+1' + patient_phone;
+    else if (patient_phone.length === 11 && patient_phone.startsWith('1')) patient_phone = '+' + patient_phone;
+  }
+
   const data = readDB();
-  const id   = crypto.randomUUID();
-  const dt   = new Date(datetime);
 
   const appointment = {
     id,
