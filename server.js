@@ -48,6 +48,7 @@ app.post('/retell-functions', (req, res) => {
   console.log(`[TOOL] ${name}`, JSON.stringify(args));
   try {
     const handlers = {
+      get_current_date:       () => getCurrentDate(),
       check_availability:     () => checkAvailability(args),
       book_appointment:       () => bookAppointment(args),
       get_appointments:       () => getAppointments(args),
@@ -70,6 +71,15 @@ app.post('/retell-webhook', (req, res) => {
 });
 
 // ─── Tool functions ───────────────────────────────────────────────────────────
+function getCurrentDate() {
+  const now = new Date();
+  return {
+    today: now.toISOString().split('T')[0],
+    day_of_week: now.toLocaleDateString('en-US', { weekday: 'long' }),
+    formatted: now.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })
+  };
+}
+
 function checkAvailability({ preferred_date, service_name }) {
   const date    = new Date(preferred_date || Date.now());
   const dateStr = date.toISOString().split('T')[0];
